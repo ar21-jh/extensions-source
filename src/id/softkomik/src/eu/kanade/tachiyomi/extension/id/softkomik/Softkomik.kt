@@ -215,17 +215,23 @@ class Softkomik : HttpSource() {
     private fun imageInterceptor(chain: Interceptor.Chain): Response {
         val request = chain.request()
 
+        var unknownHostError: java.net.UnknownHostException? = null
         val response = try {
             chain.proceed(request)
         } catch (e: java.net.UnknownHostException) {
+            unknownHostError = e
             null
         }
 
         if (response?.isSuccessful == true) return response
-        response?.close()
 
         val currentHost = cdnUrls.firstOrNull { request.url.toString().startsWith(it) }
-            ?: return throw java.net.UnknownHostException("Unknown CDN host: ${request.url.host}")
+        // Only chapter CDN URLs should use retry host fallback. Non-CDN hosts (e.g. cover URL) should pass through.
+        if (currentHost == null) {
+            return response ?: throw (unknownHostError ?: java.net.UnknownHostException(request.url.host))
+        }
+
+        response?.close()
 
         val imagePath = request.url.toString().removePrefix(currentHost).removePrefix("/")
         val otherHosts = cdnUrls.filter { it != currentHost }
@@ -236,13 +242,13 @@ class Softkomik : HttpSource() {
             val newUrl = "$newHost/$imagePath".toHttpUrl()
             latestResponse = try {
                 chain.proceed(request.newBuilder().url(newUrl).build())
-            } catch (e: java.net.UnknownHostException) {
+            } catch (_: java.net.UnknownHostException) {
                 null
             }
             if (latestResponse?.isSuccessful == true) return latestResponse
         }
 
-        return latestResponse ?: throw java.net.UnknownHostException("All CDN hosts failed for: $imagePath")
+        return latestResponse ?: throw (unknownHostError ?: java.net.UnknownHostException("All CDN hosts failed for: $imagePath"))
     }
 
     private fun apiAuthInterceptor(chain: Interceptor.Chain): Response {
