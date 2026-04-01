@@ -23,6 +23,7 @@ class Softkomik : HttpSource() {
     override val supportsLatest = true
 
     private var session: SessionDto? = null
+    private var sessionUrlCursor = 0
 
     private val rscHeaders = headersBuilder()
         .add("rsc", "1")
@@ -264,29 +265,66 @@ class Softkomik : HttpSource() {
     private fun apiAuthInterceptor(chain: Interceptor.Chain): Response {
         val request = chain.request()
 
-        if (!request.url.host.endsWith("softdevices.my.id") || request.url.toString().startsWith(coverUrl)) {
+        if (!request.url.toString().startsWith(apiUrl)) {
             return chain.proceed(request)
         }
 
-        val session = getSession()
+        val firstResponse = proceedApiRequestWithSession(chain, request, forceRefresh = false)
+        if (firstResponse.code != 403) {
+            return firstResponse
+        }
 
+        firstResponse.close()
+        session = null
+
+        // Some session endpoints can return 200 with a token that is still rejected by API (403),
+        // so rotate session source and retry until each endpoint has been tried once.
+        var lastError: Throwable? = null
+        repeat(sessionUrls.size) {
+            val retryResponse = try {
+                proceedApiRequestWithSession(chain, request, forceRefresh = true)
+            } catch (e: Exception) {
+                lastError = e
+                return@repeat
+            }
+
+            if (retryResponse.code != 403) {
+                return retryResponse
+            }
+
+            retryResponse.close()
+            session = null
+        }
+
+        if (lastError != null) {
+            throw Exception("Semua endpoint session gagal menghasilkan token yang valid untuk API Softkomik.", lastError)
+        }
+
+        throw Exception("Semua endpoint session menghasilkan token yang ditolak API Softkomik (HTTP 403).")
+    }
+
+    private fun proceedApiRequestWithSession(
+        chain: Interceptor.Chain,
+        request: Request,
+        forceRefresh: Boolean,
+    ): Response {
+        val session = getSession(forceRefresh = forceRefresh)
         val newRequest = request.newBuilder()
             .addHeader("X-Token", session.token)
             .addHeader("X-Sign", session.sign)
             .build()
-
         return chain.proceed(newRequest)
     }
 
-    private fun getSession(): SessionDto {
+    private fun getSession(forceRefresh: Boolean = false): SessionDto {
         val currentSession = session
-        if (currentSession != null && currentSession.ex > System.currentTimeMillis()) {
+        if (!forceRefresh && currentSession != null && currentSession.ex > System.currentTimeMillis()) {
             return currentSession
         }
 
         synchronized(this) {
             val currentSessionSync = session
-            if (currentSessionSync != null && currentSessionSync.ex > System.currentTimeMillis()) {
+            if (!forceRefresh && currentSessionSync != null && currentSessionSync.ex > System.currentTimeMillis()) {
                 return currentSessionSync
             }
 
@@ -298,24 +336,76 @@ class Softkomik : HttpSource() {
 
             val hasCookies = client.cookieJar
                 .loadForRequest(baseUrl.toHttpUrl())
-                .any { it.name == "zEm9be" || it.name == "AhyyL" }
+                .any { it.name == "zEm983" || it.name == "AhyyL" }
 
             if (!hasCookies) {
                 client.newCall(GET(baseUrl, headers)).execute().close()
                 client.newCall(GET("$baseUrl/api/me", apiHeaders)).execute().close()
             }
 
-            val response = client.newCall(GET("$baseUrl/api/me", apiHeaders)).execute()
+            var lastHttpCode: Int? = null
+            var lastError: Throwable? = null
 
-            if (!response.isSuccessful) {
-                val code = response.code
-                response.close()
-                throw Exception("Gagal mendapatkan akses token dari Softkomik (HTTP $code).")
+            if (forceRefresh) {
+                rotateSessionCursor()
+            }
+            val startIndex = sessionUrlCursor
+
+            fun fetchSessionAt(index: Int): SessionDto? {
+                val sessionUrl = sessionUrls[index]
+                val response = try {
+                    client.newCall(GET(sessionUrl, apiHeaders)).execute()
+                } catch (e: Exception) {
+                    lastError = e
+                    return null
+                }
+
+                response.use {
+                    if (!it.isSuccessful) {
+                        lastHttpCode = it.code
+                        return null
+                    }
+
+                    val newSession = try {
+                        it.parseAs<SessionDto>()
+                    } catch (e: Exception) {
+                        lastError = e
+                        return null
+                    }
+                    session = newSession
+                    sessionUrlCursor = index
+                    return newSession
+                }
             }
 
-            val newSession = response.use { it.parseAs<SessionDto>() }
-            session = newSession
-            return newSession
+            // Try endpoints sequentially: startIndex..end, then 0..startIndex-1.
+            for (index in startIndex until sessionUrls.size) {
+                val newSession = fetchSessionAt(index)
+                if (newSession != null) return newSession
+            }
+            if (startIndex > 0) {
+                var index = 0
+                while (index < startIndex) {
+                    val newSession = fetchSessionAt(index)
+                    if (newSession != null) return newSession
+                    index += 1
+                }
+            }
+
+            if (lastError != null) {
+                throw Exception("Gagal mendapatkan akses token dari Softkomik setelah mencoba semua endpoint session.", lastError)
+            }
+
+            throw Exception("Gagal mendapatkan akses token dari Softkomik (HTTP ${lastHttpCode ?: "unknown"}).")
+        }
+    }
+
+    // Rotate session URL cursor to try a different endpoint on the next forced refresh,
+    // in case some endpoints are more likely to return valid tokens than others.
+    private fun rotateSessionCursor() {
+        sessionUrlCursor += 1
+        if (sessionUrlCursor >= sessionUrls.size) {
+            sessionUrlCursor = 0
         }
     }
 
@@ -349,5 +439,10 @@ class Softkomik : HttpSource() {
         "https://f1.softkomik.com/file/softkomik-image",
         "https://img.softdevices.my.id/softkomik-image",
         "https://image.softkomik.com/softkomik",
+    )
+    private val sessionUrls = listOf(
+        "$baseUrl/api/sessions",
+        "$baseUrl/api/me",
+        "$baseUrl/api/se",
     )
 }
